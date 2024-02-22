@@ -1,0 +1,9 @@
+hostaddr: "10.10.88.8"
+port: 5432
+user: "gilbertnm"
+password: "B0B0cakes0121!@"
+dbname: "cexplorer"
+matrixuser: "@balance_bot:forum.balanceanalytics.io"
+matrixpassword: "I@mHum@n!"
+matrixroom: "!utfXrpCSNPYMNTdVvZ:forum.balanceanalytics.io"
+matrixtoken: "syt_YmFsYW5jZV9ib3Q_NYZUBSqxRISdumCbwBAl_2VVXfj"

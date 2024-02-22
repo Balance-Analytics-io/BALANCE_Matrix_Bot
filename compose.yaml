@@ -1,0 +1,7 @@
+services:
+  balance_bot:
+    build:
+      context: .
+    ports:
+      - 8000:8000
+
