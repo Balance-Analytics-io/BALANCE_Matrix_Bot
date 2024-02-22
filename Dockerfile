@@ -8,4 +8,4 @@ COPY ./ ./
 RUN cargo build --release
 
 # Run the binary
-CMD ["./target/release/docker_rust_image"]
+CMD ["./target/release/balance_matrix_bot"]
