@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
                         // println!("{}  ❌ {} ₳", address, ada);
 
-                        let departuresmsg: String = format!("{}  ❌ {} ₳", address, ada);
+                        let departuresmsg: String = format!("❌ {} ₳ from {}  ", ada, address);
 
                         Matrix::message(&departuresmsg).await?;
 
@@ -223,7 +223,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
                         // println!("{}  ✅ {} ₳", address, ada);
 
-                        let arrivalsmsg: String = format!("{}  ✅ {} ₳", address, ada);
+                        let arrivalsmsg: String = format!("✅ {} ₳ from {}  ", ada, address);
 
                         Matrix::message(&arrivalsmsg).await?;
 
