@@ -8,4 +8,4 @@ COPY ./ ./
 RUN cargo build --release
 
 # Run the binary
-CMD ["./target/release/balance_matrix_bot"]
+CMD ["./target/release/balance_bot"]
