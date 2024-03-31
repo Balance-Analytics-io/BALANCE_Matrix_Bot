@@ -1,24 +1,27 @@
 use std::collections::HashMap;
-use tokio_postgres::{Client, Error, NoTls};
+
 use std::fs::File;
 use std::io::Read;
 use std::vec::Vec;
 use std::error::Error as StdError;
+use std::pin::Pin;
+use std::future::Future;
+use std::time::Duration;
+use std::{env, process::exit};
+
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio_postgres::types::Type;
+
 use log::{info, debug};
-use chrono::NaiveDate;
+
 use reqwest::Url;
 use reqwest;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use chrono::DateTime;
-use chrono::{Duration, Timelike, Utc};
-use tokio::time;
-use tokio::task;
+
 use rust_decimal::Decimal;
+
 use thousands::{Separable, SeparatorPolicy, digits};
-use std::{env, process::exit};
+
 use matrix_sdk::{
     config::SyncSettings,
     ruma::events::room::{
@@ -27,9 +30,15 @@ use matrix_sdk::{
     },
     Client as MatrixClient, Room, RoomState,
 };
-use tokio::time::{sleep};
+
 use indoc::formatdoc;
 
+use tokio::{task, time};
+use tokio_postgres::{Client, Error, NoTls};
+use tokio_postgres::types::Type;
+
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 
 
 
@@ -111,8 +120,6 @@ struct PoolStats {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>>  {
 
-    
-
     tokio::task::spawn(async {
 
 
@@ -127,200 +134,215 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
     });
 
 
+    //env::set_var("RUST_BACKTRACE", "full");
 
+    //env_logger::init();
 
-    env_logger::init();
-
-    let mut target_dt = get_prev_1_min_dt(Utc::now());
     let mut prevforged: Vec<HashMap<String, i64>> = vec![];
     let mut prevdelegators: Vec<HashMap<String, String>> = vec![];
     let mut prevpoolstake: Vec<HashMap<String, Decimal>> = vec![];
 
+    let mut interval = time::interval(Duration::from_secs(60));
 
-    loop {
+
+        loop {
+            interval.tick().await;
+
+            let mut tasks = FuturesUnordered::<Pin<Box<dyn Future<Output = String>>>>::new();
+            
+            tasks.push(Box::pin(blocks(&mut prevforged)));
+            tasks.push(Box::pin(delegators(&mut prevdelegators)));
+            tasks.push(Box::pin(stake(&mut prevpoolstake)));
+
+            while let Some(result) = tasks.next().await {
+                println!("{}", result);
+
+            }
+        }
+    }
 
 
-        // ESATBLISH CONNECTION TO POSTGRES DB INSTANCE
-        
-        target_dt = target_dt.checked_add_signed(Duration::seconds(60)).unwrap();
-        let diff = (target_dt - Utc::now()).to_std().unwrap();
-        time::sleep(diff).await;
-        
-        let db = Database::new().await?;
+
+
+
+
+    fn read_config() -> Result<DatabaseConfig, Box<dyn std::error::Error>> {
+        let mut file = File::open("config.yaml")?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let config: DatabaseConfig = serde_yaml::from_str(&contents)?;
+        Ok(config)
+    }
+
+    async fn blocks(prevforged: &mut Vec<HashMap<String, i64>>) -> String {
+        let db = Database::new().await.expect("Problem with db connection");
+        db.ping().await;
     
-        db.ping().await?;
-
-
-        //  GET LATEST BLOCK & DELEGATOR DATA
-
-        let curforged = db.fetch_block_data("Select * from balance.bot_blocks_forged").await?;
-        let curdelegators = db.fetch_delegator_data("Select * from balance.bot_delegator_list").await?;
-        let curpoolstake = db.fetch_poolstake_data("Select * From balance.bot_live_stake").await?;
-
-
-        // PROCESS NEW BLOCK DATA
+        let curforged = db.fetch_block_data("Select * from balance.bot_blocks_forged").await.expect("Problem with pull latest block forge data");
 
         if prevforged.is_empty() {
-            prevforged = curforged.clone();
+            *prevforged = curforged.clone();
             println!("Startup block forge data loaded");
+
         } else {
             println!("Checking for block forge updates");
             let blockdiff: Vec<_> = curforged.into_iter().filter(|item| !prevforged.contains(item)).collect();
 
             if blockdiff.is_empty() {
-                println!(" -- No new blocks forged");
-                
-            } else {
-                println!(" -- New blocks forged!  Sending message....");
-
-                let mut config = read_config().expect("Failed to read config");
-
-                let map =  serde_json::to_string(&blockdiff[0]).unwrap();
-                let p: Blocks = serde_json::from_str(&map)?;
-                
-                let blockmsg: String = format!("⚒️   {} / {}  blocks forged for epoch  {}", p.blocks_forged, &config.slotschedule, p.epoch_no);
-                let forged = p.blocks_forged;
-
-                Matrix::message(&blockmsg).await?;
-                
-                prevforged = blockdiff.clone();
-                
-            }
-
-        }
-        
-
-        // PROCESS NEW DELEGATOR DATA
-    
-        if prevdelegators.is_empty() {
-            prevdelegators = curdelegators.clone();
-            println!("Startup delegator data loaded");
-
-        } else {
-            println!("Checking for delegator updates");
-
-            let arrivals: Vec<_> = curdelegators.clone().into_iter().filter(|item| !prevdelegators.contains(item)).collect();
-            let departures: Vec<_> = prevdelegators.clone().into_iter().filter(|item| !curdelegators.contains(item)).collect();
-
-            if departures.is_empty() {
-                println!(" -- No departures found");
-
-            } else {
-
-                println!(" -- New departures found....processing");
-
-                // Matrix::message("Delegator(s) leaving BALNC 🙏").await?;
-
-                for (i, row_map) in departures.iter().enumerate() {
-
-                    for (key, value) in row_map.iter() {
-
-                        let addressquery: String = format!("Select * From balance.bot_address_value('{}')", value);
-
-                        let departuredata = db.fetch_address_data(&addressquery).await?;
-
-                        let serialized = serde_json::to_string(&departuredata).unwrap();;
-                        let deserialized: Vec<Address> = serde_json::from_str(&serialized).unwrap();
-
-                        let policy = SeparatorPolicy {
-                            separator: ',',
-                            groups:    &[3],
-                            digits:    digits::ASCII_DECIMAL,
-                        };
-
-                        let ada = deserialized[0].ada_value.separate_by_policy(policy);
-                        let address = &deserialized[0].stake_address[..10];
-                        let newpool = &deserialized[0].to_pool;
-
-                        // let departuresmsg: String = format!("❌   {} ₳  Delegation Departing  {}   🙏  -  {}", ada, address, newpool);
-
-                        let departuresmsg: String = formatdoc!(r#"
-                        ❌   {} ₳  Delegation Departing   🙏
-                            ▫️  Stake Address  {}
-                            ▫️  To  {}"#, ada, address, newpool);
-
-                        Matrix::message(&departuresmsg).await?;
-
-                        prevdelegators = curdelegators.clone();
-
-                        println!(" -- New departures send message complete");
-
-                    }
-                }
-
-            }
-
-            if arrivals.is_empty() {
-                println!(" -- No arrivals found");
-
-            } else {
-
-                println!(" -- New arrivals found....processing");
-
-                // Matrix::message("Welcome new BALNC delegator(s)! 👏").await?;
-
-                for (i, row_map) in arrivals.iter().enumerate() {
-
-                    for (key, value) in row_map.iter() {
-
-                        let addressquery: String = format!("Select * From balance.bot_address_value('{}')", value);
-
-                        let arrivaldata = db.fetch_address_data(&addressquery).await?;
-
-                        let serialized = serde_json::to_string(&arrivaldata).unwrap();;
-                        let deserialized: Vec<Address> = serde_json::from_str(&serialized).unwrap();
-
-                        let policy = SeparatorPolicy {
-                            separator: ',',
-                            groups:    &[3],
-                            digits:    digits::ASCII_DECIMAL,
-                        };
-
-                        let ada = deserialized[0].ada_value.separate_by_policy(policy);
-                        let address = &deserialized[0].stake_address[..10];
-                        let prevpool = &deserialized[0].from_pool;
-
-                        if prevpool != "" {
-                            let arrivalsmsg: String = formatdoc!(r#"
-                            ✅   {} ₳  Delegation Arriving   👏 
-                                ▫️  Stake Address  {}
-                                ▫️  From  {}"#, ada, address, prevpool);
-
-                            Matrix::message(&arrivalsmsg).await?;
-
-                            prevdelegators = curdelegators.clone();
-
-                            println!(" -- New arrivals send message complete");
-
-                        } else {
-                            let arrivalsmsg: String = formatdoc!(r#"
-                            ✅   {} ₳  Delegation Arriving   👏 
-                                ▫️  Stake Address  {}"#, ada, address);
-
-                            Matrix::message(&arrivalsmsg).await?;
-
-                            prevdelegators = curdelegators.clone();
-
-                            println!(" -- New arrivals send message complete");
-
-
-                        }
-
+                        println!(" -- No new blocks forged");
                         
+                    } else {
+                        println!(" -- New blocks forged!  Sending message....");
+        
+                        let mut config = read_config().expect("Failed to read config");
+        
+                        let map =  serde_json::to_string(&blockdiff[0]).unwrap();
+                        let p: Blocks = serde_json::from_str(&map).expect("REASON");
+                        
+                        let blockmsg: String = format!("⚒️   {} / {}  blocks forged for epoch  {}", p.blocks_forged, &config.slotschedule, p.epoch_no);
+                       
+        
+                        Matrix::message(&blockmsg).await.expect("REASON");
+                        
+                        
+                        *prevforged = blockdiff.clone();
+                        
+                    }
+        }
+        "Task - Forged Blocks Complete".to_owned()
+    }
 
+    async fn delegators(prevdelegators: &mut Vec<HashMap<String, String>>) -> String {
+        let db = Database::new().await.expect("Problem with db connection");
+        db.ping().await;
+
+        let curdelegators = db.fetch_delegator_data("Select * from balance.bot_delegator_list").await.expect("Problem with pulling latest delegator data");
+
+            if prevdelegators.is_empty() {
+                *prevdelegators = curdelegators.clone();
+                println!("Startup delegator data loaded");
+            
+            } else {
+                println!("Checking for delegator updates");
+    
+                let arrivals: Vec<_> = curdelegators.clone().into_iter().filter(|item| !prevdelegators.contains(item)).collect();
+                let departures: Vec<_> = prevdelegators.clone().into_iter().filter(|item| !curdelegators.contains(item)).collect();
+    
+                if departures.is_empty() {
+                    println!(" -- No departures found");
+    
+                } else {
+    
+                    println!(" -- New departures found....processing");
+    
+                    for (i, row_map) in departures.iter().enumerate() {
+    
+                        for (key, value) in row_map.iter() {
+    
+                            let addressquery: String = format!("Select * From balance.bot_address_value('{}')", value);
+    
+                            let departuredata = db.fetch_address_data(&addressquery).await.expect("REASON");
+    
+                            let serialized = serde_json::to_string(&departuredata).unwrap();;
+                            let deserialized: Vec<Address> = serde_json::from_str(&serialized).unwrap();
+    
+                            let policy = SeparatorPolicy {
+                                separator: ',',
+                                groups:    &[3],
+                                digits:    digits::ASCII_DECIMAL,
+                            };
+    
+                            let ada = deserialized[0].ada_value.separate_by_policy(policy);
+                            let address = &deserialized[0].stake_address[..10];
+                            let newpool = &deserialized[0].to_pool;
+    
+                            let departuresmsg: String = formatdoc!(r#"
+                            ❌   {} ₳  Delegation Departing   🙏
+                                ▫️  Stake Address  {}
+                                ▫️  To  {}"#, ada, address, newpool);
+    
+                            Matrix::message(&departuresmsg).await.expect("REASON");
+    
+                            *prevdelegators = curdelegators.clone();
+    
+                            println!(" -- New departures send message complete");
+    
+                        }
+                    }
+    
+                }
+    
+                if arrivals.is_empty() {
+                    println!(" -- No arrivals found");
+    
+                } else {
+    
+                    println!(" -- New arrivals found....processing");
+    
+                    for (i, row_map) in arrivals.iter().enumerate() {
+    
+                        for (key, value) in row_map.iter() {
+    
+                            let addressquery: String = format!("Select * From balance.bot_address_value('{}')", value);
+    
+                            let arrivaldata = db.fetch_address_data(&addressquery).await.expect("REASON");
+    
+                            let serialized = serde_json::to_string(&arrivaldata).unwrap();;
+                            let deserialized: Vec<Address> = serde_json::from_str(&serialized).unwrap();
+    
+                            let policy = SeparatorPolicy {
+                                separator: ',',
+                                groups:    &[3],
+                                digits:    digits::ASCII_DECIMAL,
+                            };
+    
+                            let ada = deserialized[0].ada_value.separate_by_policy(policy);
+                            let address = &deserialized[0].stake_address[..10];
+                            let prevpool = &deserialized[0].from_pool;
+    
+                            if prevpool != "" {
+                                let arrivalsmsg: String = formatdoc!(r#"
+                                ✅   {} ₳  Delegation Arriving   👏 
+                                    ▫️  Stake Address  {}
+                                    ▫️  From  {}"#, ada, address, prevpool);
+    
+                                Matrix::message(&arrivalsmsg).await.expect("REASON");
+    
+                                *prevdelegators = curdelegators.clone();
+    
+                                println!(" -- New arrivals send message complete");
+    
+                            } else {
+                                let arrivalsmsg: String = formatdoc!(r#"
+                                ✅   {} ₳  Delegation Arriving   👏 
+                                    ▫️  Stake Address  {}"#, ada, address);
+    
+                                Matrix::message(&arrivalsmsg).await.expect("REASON");
+    
+                                *prevdelegators = curdelegators.clone();
+    
+                                println!(" -- New arrivals send message complete");
+    
+    
+                            }
+                        }
                     }
                 }
-
             }
 
-        // PROCESS POOL STAKE DATA
+        "Task - Delegators Complete".to_owned()
+    }
 
+    async fn stake(prevpoolstake: &mut Vec<HashMap<String, Decimal>>) -> String {
+        let db = Database::new().await.expect("Problem with db connection");
+        db.ping().await;
 
-    
+        let curpoolstake = db.fetch_poolstake_data("Select * From balance.bot_live_stake").await.expect("REASON");
+
         if prevpoolstake.is_empty() {
-            prevpoolstake = curpoolstake.clone();
+            *prevpoolstake = curpoolstake.clone();
             println!("Startup pool stake data loaded");
-
+            
         } else {
             println!("Checking for pool stake updates");
 
@@ -336,8 +358,6 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
             } else {
 
                 println!(" -- Pool stake updates found....processing");
-
-                // Matrix::message("BALNC live stake update... 👀").await?;
 
                 let prevstakeserialized = serde_json::to_string(&prevpoolstake).unwrap();
                 let prevstakedeserialized: Vec<PoolStake> = serde_json::from_str(&prevstakeserialized).unwrap();
@@ -359,57 +379,31 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
                     let value = diff.separate_by_policy(policy);
                     let totalvalue = curstakedeserialized[0].live_stake.separate_by_policy(policy);
                     let stakemsg: String = format!("❌   Live Stake   ⬇️   {} ₳", value);
-                    // let stakemsg2: String = format!("BALNC live Stake total {} ₳", totalvalue);
-                    Matrix::message(&stakemsg).await?;
-                    // Matrix::message(&stakemsg2).await?;
-                    prevpoolstake = curpoolstake.clone();
+                    
+                    Matrix::message(&stakemsg).await.expect("REASON");
+                    
+                    *prevpoolstake = curpoolstake.clone();
 
                 } else if diff > positivebuffer {
 
                     let value = diff.separate_by_policy(policy);
                     let totalvalue = curstakedeserialized[0].live_stake.separate_by_policy(policy);
                     let stakemsg: String = format!("✅   Live Stake   ⬆️   {} ₳", value);
-                    // let stakemsg2: String = format!("BALNC live Stake total {} ₳", totalvalue);
-                    Matrix::message(&stakemsg).await?;
-                    // Matrix::message(&stakemsg2).await?;
-                    prevpoolstake = curpoolstake.clone();
+
+                    Matrix::message(&stakemsg).await.expect("REASON");
+                    
+                    *prevpoolstake = curpoolstake.clone();
 
                 } else {
                     println!(" -- Pool stake delta inside buffer....waiting");
 
                 }
-
-                
-
             }
-
         }
-
+        "Task - Pool Stake Complete".to_owned()
     }
-}
 
-   
 
-    
-
-    
-}
-
-fn read_config() -> Result<DatabaseConfig, Box<dyn std::error::Error>> {
-    let mut file = File::open("config.yaml")?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let config: DatabaseConfig = serde_yaml::from_str(&contents)?;
-    Ok(config)
-}
-
-fn get_prev_1_min_dt(current_dt: DateTime<Utc>) -> DateTime<Utc> {
-    let target_dt = current_dt.checked_add_signed(Duration::seconds(1)).unwrap();
-    let target_minute = (target_dt.minute() / 1) * 1;
-    
-    let target_dt = target_dt.with_minute(target_minute).unwrap();
-    target_dt.with_second(0).unwrap()
-}
 
 impl Database {
 
@@ -437,6 +431,7 @@ impl Database {
     async fn ping(&self) -> Result<(), Error> {
         match self.client.simple_query("SELECT 1;").await {
             Ok(_) => {
+                //let timestamp = Utc::now();
                 println!("Successfully connected to the database.");
                 Ok(())
             }
@@ -584,10 +579,9 @@ impl Database {
         Ok(data)
     }
 
-    
-
-    
 }
+
+
 
 impl Matrix {
 
