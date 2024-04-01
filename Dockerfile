@@ -1,11 +1,21 @@
-# 1. This tells docker to use the Rust official image
-FROM rust:1.76
+FROM rust:1.76 as build
 
-# 2. Copy the files in your machine to the Docker image
-COPY ./ ./
+RUN USER=gilbertnm cargo new --bin balance_bot
+WORKDIR /balance_bot
 
-# Build your program for release
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
+
+RUN cargo build --release
+RUN rm src/*.rs
+
+COPY ./src ./src
+
+RUN rm ./target/release/deps/balance_bot*
 RUN cargo build --release
 
-# Run the binary
-CMD ["./target/release/balance_bot"]
+FROM rust:1.76
+
+COPY --from=build /balance_bot/target/release/balance_bot .
+
+CMD ["./balance_bot"]

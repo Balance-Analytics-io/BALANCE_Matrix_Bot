@@ -122,12 +122,14 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
 
     tokio::task::spawn(async {
 
-
-            let mut config = read_config().expect("Failed to read config");
+            let matrix_homeserver = env::var("MATRIX_HOMESERVER").expect("Error: MATRIX_HOMESERVER not found");
+            let matrix_user = env::var("MATRIX_USER").expect("Error: MATRIX_USER not found");
+            let matrix_password = env::var("MATRIX_PASSWORD").expect("Error: MATRIX_PASSWORD not found");
+            
 
             // tracing_subscriber::fmt::init();
             
-            Matrix::login_and_sync(config.matrixhomeserver, &config.matrixuser, &config.matrixpassword).await?;
+            Matrix::login_and_sync(matrix_homeserver, &matrix_user, &matrix_password).await?;
             Ok::<(), anyhow::Error>(())
 
 
@@ -162,18 +164,6 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
     }
 
 
-
-
-
-
-    fn read_config() -> Result<DatabaseConfig, Box<dyn std::error::Error>> {
-        let mut file = File::open("config.yaml")?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let config: DatabaseConfig = serde_yaml::from_str(&contents)?;
-        Ok(config)
-    }
-
     async fn blocks(prevforged: &mut Vec<HashMap<String, i64>>) -> String {
         let db = Database::new().await.expect("Problem with db connection");
         db.ping().await;
@@ -185,7 +175,8 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
             println!("Startup block forge data loaded");
 
         } else {
-            println!("Checking for block forge updates");
+            let slots_assigned = env::var("SLOTS_ASSIGNED").expect("Error: SLOTS_ASSIGNED not found");
+            println!("Checking for block forge updates {}", slots_assigned);
             let blockdiff: Vec<_> = curforged.into_iter().filter(|item| !prevforged.contains(item)).collect();
 
             if blockdiff.is_empty() {
@@ -194,12 +185,13 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
                     } else {
                         println!(" -- New blocks forged!  Sending message....");
         
-                        let mut config = read_config().expect("Failed to read config");
+                        
+                        let slots_assigned = env::var("SLOTS_ASSIGNED").expect("Error: SLOTS_ASSIGNED not found");
         
                         let map =  serde_json::to_string(&blockdiff[0]).unwrap();
                         let p: Blocks = serde_json::from_str(&map).expect("REASON");
                         
-                        let blockmsg: String = format!("⚒️   {} / {}  blocks forged for epoch  {}", p.blocks_forged, &config.slotschedule, p.epoch_no);
+                        let blockmsg: String = format!("⚒️   {} / {}  blocks forged for epoch  {}", p.blocks_forged, &slots_assigned, p.epoch_no);
                        
         
                         Matrix::message(&blockmsg).await.expect("REASON");
@@ -408,11 +400,17 @@ async fn main() -> Result<(), Box<dyn StdError>>  {
 impl Database {
 
     async fn new() -> Result<Self, Error> {
-        let config = read_config().expect("Failed to read config");
+
+        let host_address = env::var("HOST_ADDRESS").expect("Error: HOST_ADDRESS not found");
+        let port = env::var("PORT").expect("Error: PORT not found");
+        let user = env::var("USER").expect("Error: USER not found");
+        let password = env::var("PASSWORD").expect("Error: PASSWORD not found");
+        let db_name = env::var("DB_NAME").expect("Error: DB_NAME not found");
+        
 
         let connect_params = format!(
             "host={} port={} user={} password={} dbname={}",
-            config.hostaddr, config.port, config.user, config.password, config.dbname
+            host_address, port, user, password, db_name
         );
 
         info!("Creating a new database instance");
@@ -586,12 +584,14 @@ impl Database {
 impl Matrix {
 
     async fn new() -> Result<MatrixAuth, Box<dyn StdError>> {
-        let config = read_config().expect("Failed to read config");
+
+        let matrix_user = env::var("MATRIX_USER").expect("Error: MATRIX_USER not found");
+        let matrix_password = env::var("MATRIX_PASSWORD").expect("Error: MATRIX_PASSWORD not found");
 
         let mut map = HashMap::new();
         map.insert("type", "m.login.password");
-        map.insert("user", &config.matrixuser);
-        map.insert("password", &config.matrixpassword);
+        map.insert("user", &matrix_user);
+        map.insert("password", &matrix_password);
         map.insert("device_id", "balance_bot_service");
 
         let client = reqwest::Client::new();
@@ -611,9 +611,11 @@ impl Matrix {
     }
 
     async fn message(query: &str) -> Result<(), Box<dyn StdError>> {
-        let config = read_config().expect("Failed to read config");
 
-        let mut url: String = format!("https://matrix.forum.balanceanalytics.io/_matrix/client/r0/rooms/{}/send/m.room.message?access_token={}", config.matrixroom, config.matrixtoken);
+        let matrix_room = env::var("MATRIX_ROOM").expect("Error: MATRIX_ROOM not found");
+        let matrix_token = env::var("MATRIX_TOKEN").expect("Error: MATRIX_TOKEN not found");
+
+        let mut url: String = format!("https://matrix.forum.balanceanalytics.io/_matrix/client/r0/rooms/{}/send/m.room.message?access_token={}", matrix_room, matrix_token);
 
         let mut map = HashMap::new();
         map.insert("msgtype", "m.text");
@@ -664,8 +666,6 @@ impl Matrix {
 
     async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
 
-        
-        
         if room.state() != RoomState::Joined {
             return;
         }
